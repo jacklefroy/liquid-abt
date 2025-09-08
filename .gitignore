@@ -1,36 +1,44 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# LIQUID ABT - Minimal .gitignore for Developer Review
+# Only excludes truly sensitive production data
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
-.yarn/install-state.gz
+# Build outputs and dependencies (standard exclusions)
+node_modules/
+.next/
+/out/
+*.tsbuildinfo
 
-# testing
+# Development tools
+.DS_Store
+.vscode/
+.idea/
+
+# Only exclude genuinely sensitive files:
+
+# Real production credentials (if any exist)
+.env.production
+.env.prod
+*prod*.key
+*production*.key
+
+# Real private keys and wallets (if any exist)  
+wallet.dat
+*.wallet
+*private-key-prod*
+*mainnet*.key
+
+# Logs that might contain sensitive data
+*.log
+logs/
+
+# Temporary and cache files
+.cache/
+*.tmp
+*.temp
+
+# Test coverage reports
 /coverage
 
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-
-# debug
+# Package manager debug logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-
-# local env files
-.env*.local
-
-# vercel
-.vercel
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts

@@ -1,0 +1,282 @@
+// LIQUID ABT - Multi-Tenant Database Schema
+// This schema defines the master database structure for tenant management
+// Each tenant will have their own schema created dynamically
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// MASTER SCHEMA - Tenant Management
+model Tenant {
+  id                String   @id @default(uuid())
+  companyName       String
+  subdomain         String   @unique // For {subdomain}.liquidtreasury.business
+  subscriptionTier  SubscriptionTier @default(FREE)
+  isActive          Boolean  @default(true)
+  schemaName        String   @unique // tenant_${uuid} for schema isolation
+  
+  // Subscription Details
+  stripeCustomerId  String?
+  currentPeriodEnd  DateTime?
+  cancelAtPeriodEnd Boolean  @default(false)
+  
+  // Usage Limits (based on subscription tier)
+  monthlyVolumeLimit  Float   @default(50000) // $50K default for free tier
+  dailyVolumeLimit    Float   @default(5000)  // $5K daily limit
+  maxTransactionLimit Float   @default(1000)  // $1K max transaction
+  maxUsers           Int      @default(2)     // 2 users for free tier
+  maxIntegrations    Int      @default(2)     // 2 integrations for free tier
+  
+  // Contact & Business Info
+  contactEmail       String
+  businessAddress    String?
+  abn                String? // Australian Business Number
+  
+  // Compliance Settings
+  cgtMethod          CGTMethod @default(FIFO)
+  taxYear            Int       @default(2024)
+  
+  // Timestamps
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  
+  // Relations
+  users             User[]
+  subscriptionHistory SubscriptionHistory[]
+  
+  @@map("tenants")
+}
+
+// Webhook Event Tracking for Idempotency
+model WebhookEvent {
+  id          String   @id @default(uuid())
+  eventId     String   // Provider's event ID (e.g., Stripe's evt_xxx)
+  provider    String   // stripe, square, paypal, etc.
+  eventType   String   // payment_intent.succeeded, etc.
+  processed   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime // 24-hour expiry
+  
+  // Composite unique constraint to prevent duplicate events per provider
+  @@unique([eventId, provider], name: "eventId_provider")
+  @@index([expiresAt]) // For efficient cleanup
+  @@map("webhook_events")
+}
+
+// Users belong to tenants but are stored in master schema for auth
+model User {
+  id           String     @id @default(uuid())
+  tenantId     String
+  email        String     @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         UserRole   @default(USER)
+  isActive     Boolean    @default(true)
+  
+  // MFA Settings
+  mfaEnabled   Boolean    @default(false)
+  mfaSecret    String?
+  
+  // Last Activity
+  lastLoginAt  DateTime?
+  lastActiveAt DateTime?
+  
+  // Timestamps
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  
+  // Relations
+  tenant       Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  @@map("users")
+}
+
+// Subscription tier history tracking
+model SubscriptionHistory {
+  id                String           @id @default(uuid())
+  tenantId          String
+  previousTier      SubscriptionTier
+  newTier           SubscriptionTier
+  changeReason      String?
+  effectiveDate     DateTime         @default(now())
+  
+  // Relations
+  tenant            Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  @@map("subscription_history")
+}
+
+// Enums
+enum SubscriptionTier {
+  FREE      // $0/month, 1.25% fee
+  GROWTH    // $24.99/month, 0.55% fee  
+  PRO       // $97.99/month, 0.5% fee
+  ENTERPRISE // Custom pricing, 0.2% fee
+}
+
+enum UserRole {
+  OWNER     // Full access, billing management
+  ADMIN     // Treasury rules, integrations, reporting
+  USER      // Dashboard viewing, basic reporting
+  VIEWER    // Read-only access (for accountants)
+}
+
+enum CGTMethod {
+  FIFO              // First In, First Out
+  LIFO              // Last In, First Out
+  WEIGHTED_AVERAGE  // Weighted Average
+  SPECIFIC_ID       // Specific Identification
+}
+
+// =============================================================================
+// TENANT-SPECIFIC MODELS (Created in each tenant schema)
+// These models are replicated in each tenant's isolated schema
+// =============================================================================
+
+// Payment Reconciliation System Models
+// These models support the comprehensive reconciliation and recovery system
+
+model ReconciliationLog {
+  id                      String   @id @default(uuid())
+  tenantId                String
+  totalPayments           Int
+  totalBitcoinPurchases   Int
+  matchedPairs            Int
+  orphanedPayments        Int
+  orphanedPurchases       Int
+  amountMismatches        Int
+  totalDiscrepancyValue   Decimal  @db.Decimal(18,2)
+  reconciliationAccuracy  Decimal  @db.Decimal(5,2) // Percentage with 2 decimal places
+  criticalIssues          Int      @default(0)
+  oldestOrphanAgeMinutes  Int      @default(0)
+  orphanDetails           String?  // JSON string with orphaned payment details
+  executionTimeMs         Int      @default(0)
+  createdAt               DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([createdAt])
+  @@index([criticalIssues])
+  @@map("reconciliation_logs")
+}
+
+model FailedTransaction {
+  id                   String   @id @default(uuid())
+  tenantId             String
+  stripePaymentId      String   @unique
+  customerId           String
+  originalAmount       Decimal  @db.Decimal(18,2)
+  currency             String   @default("AUD")
+  failureReason        String
+  status               String   // 'pending', 'retrying', 'recovered', 'refunded', 'manual_review_required'
+  priority             String   @default("normal") // 'normal', 'high', 'critical'
+  
+  // Retry management
+  retryAttempts        Int      @default(0)
+  maxRetryAttempts     Int      @default(3)
+  nextRetryAt          DateTime?
+  lastAttemptAt        DateTime?
+  lastError            String?
+  
+  // Resolution tracking
+  recoveredAt          DateTime?
+  refundedAt           DateTime?
+  finalAttemptNumber   Int?
+  bitcoinPurchaseId    String?
+  refundId             String?
+  refundAmount         Decimal? @db.Decimal(18,2)
+  withdrawalAddress    String?
+  recoveryNotes        String?
+  
+  // Metadata
+  metadata             String?  // JSON string for additional data
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  // Relations
+  recoveryAttempts     RecoveryAttempt[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([priority])
+  @@index([nextRetryAt])
+  @@index([stripePaymentId])
+  @@index([customerId])
+  @@index([createdAt])
+  @@map("failed_transactions")
+}
+
+model RecoveryAttempt {
+  id                   String   @id @default(uuid())
+  tenantId             String
+  failedTransactionId  String
+  attemptNumber        Int
+  attemptedAt          DateTime @default(now())
+  success              Boolean
+  error                String?
+  bitcoinPurchaseId    String?
+  exchangeOrderId      String?
+  executionTimeMs      Int      @default(0)
+  metadata             String?  // JSON string for additional recovery data
+
+  // Relations
+  failedTransaction    FailedTransaction @relation(fields: [failedTransactionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([failedTransactionId])
+  @@index([success])
+  @@index([attemptedAt])
+  @@map("recovery_attempts")
+}
+
+// Enhanced Stripe Payment model for reconciliation
+model StripePayment {
+  id                String   @id @default(uuid())
+  stripePaymentId   String   @unique
+  customerId        String
+  amount            Int      // Amount in cents
+  currency          String
+  status            String   // 'succeeded', 'failed', 'canceled', 'requires_action'
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  bitcoinPurchase   BitcoinPurchase[]
+
+  @@index([stripePaymentId])
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("stripe_payments")
+}
+
+// Enhanced Bitcoin Purchase model for reconciliation
+model BitcoinPurchase {
+  id                String   @id @default(uuid())
+  customerId        String
+  stripePaymentId   String?
+  bitcoinAmount     Decimal  @db.Decimal(18,8)
+  fiatAmount        Decimal  @db.Decimal(18,8)
+  fiatCurrency      String   @default("AUD")
+  exchangeRate      Decimal  @db.Decimal(18,2)
+  transactionId     String?  // Exchange transaction ID
+  fees              Decimal  @db.Decimal(18,8)
+  status            String   // 'pending', 'completed', 'failed'
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  stripePayment     StripePayment? @relation(fields: [stripePaymentId], references: [stripePaymentId])
+
+  @@index([customerId])
+  @@index([stripePaymentId])
+  @@index([transactionId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("bitcoin_purchases")
+}

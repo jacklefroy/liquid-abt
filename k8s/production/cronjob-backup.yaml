@@ -1,0 +1,380 @@
+# LIQUID ABT - Production Backup CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: database-backup
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM AEDT
+  timeZone: "Australia/Sydney"
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 10
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: liquid-abt
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: liquid-abt-backup-sa
+          containers:
+          - name: backup
+            image: liquid-abt-backup:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              
+              echo "Starting scheduled database backup..."
+              
+              # Run full backup
+              /app/scripts/backup-database.sh full
+              
+              # Run schema backup on Sundays
+              if [ "$(date +%u)" -eq 7 ]; then
+                echo "Running weekly schema backup..."
+                /app/scripts/backup-database.sh schema
+              fi
+              
+              echo "Backup job completed successfully"
+            env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: database-host
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: "liquid_abt"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: database-username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: database-password
+            - name: S3_BUCKET
+              value: "liquid-abt-backups-prod"
+            - name: ENCRYPTION_KEY_ID
+              value: "alias/liquid-abt-backups"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: slack-webhook-url
+            - name: NOTIFICATION_EMAIL
+              value: "platform@liquidtreasury.business"
+            - name: ENVIRONMENT
+              value: "production"
+            - name: AWS_DEFAULT_REGION
+              value: "ap-southeast-2"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-secret-key
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "250m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"
+            volumeMounts:
+            - name: backup-storage
+              mountPath: /app/backups
+            - name: scripts
+              mountPath: /app/scripts
+              readOnly: true
+          volumes:
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-storage-pvc
+          - name: scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: liquid-abt-backup-sa
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: liquid-abt-backup-role
+  namespace: liquid-abt-production
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: liquid-abt-backup-rolebinding
+  namespace: liquid-abt-production
+subjects:
+- kind: ServiceAccount
+  name: liquid-abt-backup-sa
+  namespace: liquid-abt-production
+roleRef:
+  kind: Role
+  name: liquid-abt-backup-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-storage-pvc
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: gp3
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup
+data:
+  backup-database.sh: |
+    #!/bin/bash
+    # This would contain the full backup script content
+    # For production, mount the actual script files
+    echo "Backup script placeholder - mount actual scripts in production"
+    exit 1
+
+---
+# Backup verification CronJob (runs 4 hours after backup)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-verification
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup-verify
+spec:
+  schedule: "0 6 * * *"  # Daily at 6 AM AEDT (4 hours after backup)
+  timeZone: "Australia/Sydney"
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: liquid-abt
+            component: backup-verify
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: liquid-abt-backup-sa
+          containers:
+          - name: backup-verify
+            image: liquid-abt-backup:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              
+              echo "Starting backup verification..."
+              
+              # Get latest backup
+              LATEST_BACKUP=$(aws s3 ls s3://$S3_BUCKET/full/ --recursive | sort | tail -1 | awk '{print $4}')
+              
+              if [ -z "$LATEST_BACKUP" ]; then
+                echo "ERROR: No backups found in S3"
+                exit 1
+              fi
+              
+              echo "Verifying backup: $LATEST_BACKUP"
+              
+              # Download and verify backup
+              aws s3 cp "s3://$S3_BUCKET/$LATEST_BACKUP" "/tmp/verify_backup.sql.gz"
+              
+              # Test gzip integrity
+              gzip -t "/tmp/verify_backup.sql.gz"
+              
+              # Test PostgreSQL dump format
+              zcat "/tmp/verify_backup.sql.gz" | head -100 | grep -q "PostgreSQL database dump"
+              
+              # Clean up
+              rm -f "/tmp/verify_backup.sql.gz"
+              
+              echo "Backup verification completed successfully"
+              
+              # Send success notification
+              if [ -n "$SLACK_WEBHOOK_URL" ]; then
+                curl -X POST "$SLACK_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"text\":\"✅ Daily backup verification passed: $LATEST_BACKUP\"}"
+              fi
+            env:
+            - name: S3_BUCKET
+              value: "liquid-abt-backups-prod"
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: slack-webhook-url
+            - name: AWS_DEFAULT_REGION
+              value: "ap-southeast-2"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-secret-key
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "200m"
+
+---
+# Backup cleanup CronJob (weekly)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cleanup
+  namespace: liquid-abt-production
+  labels:
+    app: liquid-abt
+    component: backup-cleanup
+spec:
+  schedule: "0 4 * * 0"  # Weekly on Sunday at 4 AM AEDT
+  timeZone: "Australia/Sydney"
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 1
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: liquid-abt
+            component: backup-cleanup
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: liquid-abt-backup-sa
+          containers:
+          - name: backup-cleanup
+            image: liquid-abt-backup:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              
+              echo "Starting backup cleanup process..."
+              
+              # Clean up backups older than retention period
+              RETENTION_DAYS=${RETENTION_DAYS:-30}
+              CUTOFF_DATE=$(date -d "$RETENTION_DAYS days ago" '+%Y-%m-%d')
+              
+              echo "Cleaning up backups older than $CUTOFF_DATE..."
+              
+              # List and delete old backups
+              aws s3api list-objects-v2 \
+                --bucket "$S3_BUCKET" \
+                --query "Contents[?LastModified<='$CUTOFF_DATE'].Key" \
+                --output text | while read -r key; do
+                
+                if [ -n "$key" ] && [ "$key" != "None" ]; then
+                  echo "Deleting old backup: $key"
+                  aws s3 rm "s3://$S3_BUCKET/$key"
+                fi
+              done
+              
+              echo "Backup cleanup completed"
+              
+              # Send cleanup summary
+              REMAINING_BACKUPS=$(aws s3 ls "s3://$S3_BUCKET/" --recursive | wc -l)
+              
+              if [ -n "$SLACK_WEBHOOK_URL" ]; then
+                curl -X POST "$SLACK_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"text\":\"🧹 Weekly backup cleanup completed. Remaining backups: $REMAINING_BACKUPS\"}"
+              fi
+            env:
+            - name: S3_BUCKET
+              value: "liquid-abt-backups-prod"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: slack-webhook-url
+            - name: AWS_DEFAULT_REGION
+              value: "ap-southeast-2"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: liquid-abt-secrets
+                  key: aws-backup-secret-key
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "200m"

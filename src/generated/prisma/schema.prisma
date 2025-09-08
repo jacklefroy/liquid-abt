@@ -1,0 +1,120 @@
+// LIQUID ABT - Multi-Tenant Database Schema
+// This schema defines the master database structure for tenant management
+// Each tenant will have their own schema created dynamically
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// MASTER SCHEMA - Tenant Management
+model Tenant {
+  id               String           @id @default(uuid())
+  companyName      String
+  subdomain        String           @unique // For {subdomain}.liquidtreasury.business
+  subscriptionTier SubscriptionTier @default(FREE)
+  isActive         Boolean          @default(true)
+  schemaName       String           @unique // tenant_${uuid} for schema isolation
+
+  // Subscription Details
+  stripeCustomerId  String?
+  currentPeriodEnd  DateTime?
+  cancelAtPeriodEnd Boolean   @default(false)
+
+  // Usage Limits (based on subscription tier)
+  monthlyVolumeLimit  Float @default(50000) // $50K default for free tier
+  dailyVolumeLimit    Float @default(5000) // $5K daily limit
+  maxTransactionLimit Float @default(1000) // $1K max transaction
+  maxUsers            Int   @default(2) // 2 users for free tier
+  maxIntegrations     Int   @default(2) // 2 integrations for free tier
+
+  // Contact & Business Info
+  contactEmail    String
+  businessAddress String?
+  abn             String? // Australian Business Number
+
+  // Compliance Settings
+  cgtMethod CGTMethod @default(FIFO)
+  taxYear   Int       @default(2024)
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  users               User[]
+  subscriptionHistory SubscriptionHistory[]
+
+  @@map("tenants")
+}
+
+// Users belong to tenants but are stored in master schema for auth
+model User {
+  id           String   @id @default(uuid())
+  tenantId     String
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         UserRole @default(USER)
+  isActive     Boolean  @default(true)
+
+  // MFA Settings
+  mfaEnabled Boolean @default(false)
+  mfaSecret  String?
+
+  // Last Activity
+  lastLoginAt  DateTime?
+  lastActiveAt DateTime?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("users")
+}
+
+// Subscription tier history tracking
+model SubscriptionHistory {
+  id            String           @id @default(uuid())
+  tenantId      String
+  previousTier  SubscriptionTier
+  newTier       SubscriptionTier
+  changeReason  String?
+  effectiveDate DateTime         @default(now())
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("subscription_history")
+}
+
+// Enums
+enum SubscriptionTier {
+  FREE // $0/month, 1.25% fee
+  GROWTH // $24.99/month, 0.55% fee  
+  PRO // $97.99/month, 0.5% fee
+  ENTERPRISE // Custom pricing, 0.2% fee
+}
+
+enum UserRole {
+  OWNER // Full access, billing management
+  ADMIN // Treasury rules, integrations, reporting
+  USER // Dashboard viewing, basic reporting
+  VIEWER // Read-only access (for accountants)
+}
+
+enum CGTMethod {
+  FIFO // First In, First Out
+  LIFO // Last In, First Out
+  WEIGHTED_AVERAGE // Weighted Average
+  SPECIFIC_ID // Specific Identification
+}

@@ -1,0 +1,368 @@
+# LIQUID ABT - CI/CD Pipeline
+# Automated testing, building, and deployment
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: liquid-abt
+
+jobs:
+  # Code quality and testing
+  test:
+    name: Test and Code Quality
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Setup test environment
+      run: |
+        cp .env.example .env.test
+        echo "DATABASE_URL=postgresql://test_user:test_password@localhost:5432/test_db" >> .env.test
+        echo "REDIS_URL=redis://localhost:6379" >> .env.test
+
+    - name: Generate Prisma client
+      run: npx prisma generate
+
+    - name: Run database migrations
+      run: npx prisma migrate deploy
+      env:
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+
+    - name: Run type checking
+      run: npm run type-check
+
+    - name: Run linting
+      run: npm run lint
+
+    - name: Run unit tests
+      run: npm run test
+      env:
+        NODE_ENV: test
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379
+
+    - name: Run integration tests
+      run: npm run test:integration
+      env:
+        NODE_ENV: test
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage/lcov.info
+        flags: unittests
+
+  # Security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run security audit
+      run: npm audit --audit-level=high
+
+    - name: Run Snyk security scan
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # Build and publish Docker image
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # Deploy to staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    
+    environment:
+      name: staging
+      url: https://staging.liquidtreasury.business
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-southeast-2
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name liquid-abt-staging --region ap-southeast-2
+
+    - name: Deploy to staging
+      run: |
+        # Update image tag in staging configuration
+        sed -i "s|liquid-abt:latest|${{ needs.build.outputs.image-tag }}|g" k8s/staging/kustomization.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -k k8s/staging
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/liquid-abt-app -n liquid-abt-staging --timeout=600s
+
+    - name: Run smoke tests
+      run: |
+        # Wait for service to be ready
+        sleep 60
+        
+        # Run basic health checks
+        curl -f https://staging.liquidtreasury.business/api/health || exit 1
+        
+        # Run API tests
+        npm run test:api -- --base-url=https://staging.liquidtreasury.business
+
+    - name: Notify Slack
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Deploy to production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: https://app.liquidtreasury.business
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+        aws-region: ap-southeast-2
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name liquid-abt-production --region ap-southeast-2
+
+    - name: Create database backup
+      run: |
+        # Trigger database backup before deployment
+        kubectl create job "pre-deploy-backup-$(date +%s)" \
+          --from=cronjob/database-backup \
+          -n liquid-abt-production
+
+    - name: Deploy to production
+      run: |
+        # Update image tag in production configuration
+        sed -i "s|liquid-abt:latest|${{ needs.build.outputs.image-tag }}|g" k8s/production/kustomization.yaml
+        
+        # Apply Kubernetes manifests with rolling update
+        kubectl apply -k k8s/production
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/liquid-abt-app -n liquid-abt-production --timeout=900s
+
+    - name: Run production smoke tests
+      run: |
+        # Wait for service to be ready
+        sleep 120
+        
+        # Run comprehensive health checks
+        curl -f https://app.liquidtreasury.business/api/health || exit 1
+        
+        # Test critical endpoints
+        npm run test:critical -- --base-url=https://app.liquidtreasury.business
+
+    - name: Notify team of deployment
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: 'success'
+        channel: '#general'
+        text: |
+          🚀 *LIQUID ABT Production Deployment Successful*
+          
+          Image: `${{ needs.build.outputs.image-tag }}`
+          Digest: `${{ needs.build.outputs.image-digest }}`
+          
+          All health checks passed ✅
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Create deployment record
+      run: |
+        # Record deployment in monitoring system
+        curl -X POST "https://api.liquidtreasury.business/api/internal/deployments" \
+          -H "Authorization: Bearer ${{ secrets.INTERNAL_API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "version": "${{ github.sha }}",
+            "image": "${{ needs.build.outputs.image-tag }}",
+            "environment": "production",
+            "deployedBy": "${{ github.actor }}",
+            "deployedAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+            "healthCheckPassed": true
+          }'
+
+  # Performance testing (optional, runs on main branch only)
+  performance-test:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+
+    - name: Run performance tests
+      run: |
+        k6 run --out json=performance-results.json tests/performance/load-test.js
+        
+    - name: Upload performance results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results
+        path: performance-results.json
+
+    - name: Check performance thresholds
+      run: |
+        # Parse results and check against thresholds
+        node scripts/check-performance-thresholds.js performance-results.json

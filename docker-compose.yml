@@ -1,0 +1,247 @@
+# LIQUID ABT - Docker Compose Configuration
+# Local development environment with all services
+
+version: '3.8'
+
+services:
+  # Main application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://liquid_dev:liquid_password@postgres:5432/liquid_abt_dev
+      - REDIS_URL=redis://redis:6379
+      - KRAKEN_API_KEY=${KRAKEN_API_KEY}
+      - KRAKEN_PRIVATE_KEY=${KRAKEN_PRIVATE_KEY}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - JWT_SECRET=development_jwt_secret_32_chars
+      - ENCRYPTION_KEY=dev_encryption_key_32_characters
+      - NEXT_PUBLIC_APP_URL=http://localhost:3000
+      - SENTRY_DSN=${SENTRY_DSN}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=liquid_abt_dev
+      - POSTGRES_USER=liquid_dev
+      - POSTGRES_PASSWORD=liquid_password
+      - POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+      - ./backups:/backups
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liquid_dev -d liquid_abt_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c log_statement=all
+      -c log_duration=on
+      -c log_min_duration_statement=1000
+
+  # Redis cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    command: redis-server /usr/local/etc/redis/redis.conf
+
+  # Database administration (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@liquidtreasury.business
+      - PGADMIN_DEFAULT_PASSWORD=admin_password
+      - PGADMIN_LISTEN_PORT=80
+    ports:
+      - "8080:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - admin
+
+  # Redis administration (optional)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - HTTP_USER=admin
+      - HTTP_PASSWORD=admin_password
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - admin
+
+  # Log aggregation (optional for development)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - logging
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - logging
+
+  # Monitoring (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin_password
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Backup service
+  backup:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=liquid_abt_dev
+      - POSTGRES_USER=liquid_dev
+      - POSTGRES_PASSWORD=liquid_password
+      - BACKUP_SCHEDULE=0 */6 * * *  # Every 6 hours
+    volumes:
+      - ./backups:/backups
+      - ./docker/backup/backup.sh:/usr/local/bin/backup.sh
+    command: >
+      sh -c "
+        chmod +x /usr/local/bin/backup.sh &&
+        echo '$$BACKUP_SCHEDULE /usr/local/bin/backup.sh' > /etc/crontabs/root &&
+        crond -f
+      "
+    depends_on:
+      - postgres
+    networks:
+      - liquid-abt-network
+    restart: unless-stopped
+    profiles:
+      - backup
+
+networks:
+  liquid-abt-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
